@@ -11,3 +11,7 @@ out/
 .env
 
 .vscode
+
+# Local development files
+.local/
+*.local.*
