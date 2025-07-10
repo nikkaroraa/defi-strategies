@@ -6,6 +6,7 @@ import {ERC20} from "lib/solmate/src/tokens/ERC20.sol";
 import {SafeTransferLib} from "lib/solmate/src/utils/SafeTransferLib.sol";
 import {Owned} from "lib/solmate/src/auth/Owned.sol";
 import {ReentrancyGuard} from "lib/solmate/src/utils/ReentrancyGuard.sol";
+import {FixedPointMathLib} from "lib/solmate/src/utils/FixedPointMathLib.sol";
 
 import {IMarketNeutralVault} from "./interfaces/IMarketNeutralVault.sol";
 import {IPositionManager} from "./interfaces/IPositionManager.sol";
@@ -19,7 +20,9 @@ import {IStrategy} from "./interfaces/IStrategy.sol";
  */
 contract MarketNeutralVault is IMarketNeutralVault, ERC20, Owned, ReentrancyGuard {
     using SafeTransferLib for IERC20;
+    using FixedPointMathLib for uint256;
 
+    error ZeroAddress();
     error ZeroAmount();
     error StrategyNotSet();
     error InsufficientBalance();
@@ -27,6 +30,8 @@ contract MarketNeutralVault is IMarketNeutralVault, ERC20, Owned, ReentrancyGuar
     error NotPositionManager();
     error RebalanceNotNeeded();
     error PositionManagerNotSet();
+    error DepositTooSmall();
+    error StrategyDepositFailed();
 
     /// @notice USDC token address used as the base asset
     IERC20 public immutable USDC;
@@ -44,6 +49,8 @@ contract MarketNeutralVault is IMarketNeutralVault, ERC20, Owned, ReentrancyGuar
     uint256 public constant PRECISION = 1e18;
     /// @notice maximum allowed delta tolerance in basis points (10%)
     uint256 public constant MAX_DELTA_TOLERANCE = 1000;
+    /// @notice minimum deposit amount (1 USDC to prevent dust)
+    uint256 public constant MIN_DEPOSIT = 1e6;
 
     /// @notice emergency pause state
     bool public paused;
@@ -74,6 +81,7 @@ contract MarketNeutralVault is IMarketNeutralVault, ERC20, Owned, ReentrancyGuar
      * @param _positionManager address of the position manager contract
      */
     function setPositionManager(address _positionManager) external onlyOwner {
+        if (_positionManager == address(0)) revert ZeroAddress();
         positionManager = IPositionManager(_positionManager);
     }
 
@@ -82,6 +90,7 @@ contract MarketNeutralVault is IMarketNeutralVault, ERC20, Owned, ReentrancyGuar
      * @param _spotStrategy address of the spot strategy contract
      */
     function setSpotStrategy(address _spotStrategy) external onlyOwner {
+        if (_spotStrategy == address(0)) revert ZeroAddress();
         spotStrategy = IStrategy(_spotStrategy);
     }
 
@@ -90,6 +99,7 @@ contract MarketNeutralVault is IMarketNeutralVault, ERC20, Owned, ReentrancyGuar
      * @param _perpStrategy address of the perpetual strategy contract
      */
     function setPerpStrategy(address _perpStrategy) external onlyOwner {
+        if (_perpStrategy == address(0)) revert ZeroAddress();
         perpStrategy = IStrategy(_perpStrategy);
     }
 
@@ -100,13 +110,23 @@ contract MarketNeutralVault is IMarketNeutralVault, ERC20, Owned, ReentrancyGuar
      */
     function deposit(uint256 assets) external nonReentrant whenNotPaused returns (uint256 shares) {
         if (assets == 0) revert ZeroAmount();
+        if (assets < MIN_DEPOSIT) revert DepositTooSmall();
         if (address(spotStrategy) == address(0)) revert StrategyNotSet();
         if (address(perpStrategy) == address(0)) revert StrategyNotSet();
 
+        // Calculate shares before transfer to use correct totalAssets
+        shares = _calculateShares(assets);
+
+        // Ensure we're minting at least 1 share
+        if (shares == 0) revert ZeroAmount();
+
+        // Transfer USDC from depositor
         SafeTransferLib.safeTransferFrom(ERC20(address(USDC)), msg.sender, address(this), assets);
 
-        shares = _calculateShares(assets);
+        // Mint shares to depositor
         _mint(msg.sender, shares);
+
+        // Deploy assets to strategies
         _deployAssets(assets);
 
         emit Deposit(msg.sender, assets, shares);
@@ -119,13 +139,25 @@ contract MarketNeutralVault is IMarketNeutralVault, ERC20, Owned, ReentrancyGuar
      */
     function withdraw(uint256 shares) external nonReentrant whenNotPaused returns (uint256 assets) {
         if (shares == 0) revert ZeroAmount();
-        if (shares > balanceOf[msg.sender]) revert InsufficientBalance();
 
+        uint256 userBalance = balanceOf[msg.sender];
+        if (shares > userBalance) revert InsufficientBalance();
+
+        // Calculate assets before burning shares
         assets = previewWithdraw(shares);
+
+        // Ensure we're actually withdrawing something
+        if (assets == 0) revert ZeroAmount();
+
+        // Burn shares first
         _burn(msg.sender, shares);
+
+        // Then withdraw assets from strategies
         _withdrawAssets(assets);
 
+        // Finally transfer assets to user
         SafeTransferLib.safeTransfer(ERC20(address(USDC)), msg.sender, assets);
+
         emit Withdraw(msg.sender, assets, shares);
     }
 
@@ -170,9 +202,8 @@ contract MarketNeutralVault is IMarketNeutralVault, ERC20, Owned, ReentrancyGuar
      * @param assets amount of USDC to deposit
      * @return shares amount of vault shares that would be minted
      */
-    function previewDeposit(uint256 assets) public view returns (uint256) {
-        uint256 totalAssetsBefore = totalAssets();
-        return totalAssetsBefore == 0 ? assets : (assets * totalSupply) / totalAssetsBefore;
+    function previewDeposit(uint256 assets) external view returns (uint256) {
+        return _calculateShares(assets);
     }
 
     /**
@@ -181,7 +212,15 @@ contract MarketNeutralVault is IMarketNeutralVault, ERC20, Owned, ReentrancyGuar
      * @return assets amount of USDC that would be withdrawn
      */
     function previewWithdraw(uint256 shares) public view returns (uint256) {
-        return totalSupply == 0 ? 0 : (shares * totalAssets()) / totalSupply;
+        uint256 _totalSupply = totalSupply;
+
+        if (_totalSupply == 0) {
+            return 0;
+        }
+
+        // Use mulDivDown for precise calculation without overflow
+        // assets = (shares * totalAssets) / totalSupply
+        return shares.mulDivDown(totalAssets(), _totalSupply);
     }
 
     /**
@@ -194,7 +233,7 @@ contract MarketNeutralVault is IMarketNeutralVault, ERC20, Owned, ReentrancyGuar
     }
 
     /// @notice returns whether the vault is currently paused
-    function isPaused() public view returns (bool) {
+    function isPaused() external view returns (bool) {
         return paused;
     }
 
@@ -210,8 +249,17 @@ contract MarketNeutralVault is IMarketNeutralVault, ERC20, Owned, ReentrancyGuar
 
     /// @dev calculates shares to mint based on deposit amount and current exchange rate
     function _calculateShares(uint256 assets) internal view returns (uint256) {
-        uint256 totalAssetsBefore = totalAssets();
-        return totalAssetsBefore == 0 ? assets : (assets * totalSupply) / totalAssetsBefore;
+        uint256 _totalSupply = totalSupply;
+        uint256 _totalAssets = totalAssets();
+
+        // First depositor gets 1:1 shares
+        if (_totalSupply == 0 || _totalAssets == 0) {
+            return assets;
+        }
+
+        // Use mulDivDown for precise calculation without overflow
+        // shares = (assets * totalSupply) / totalAssets
+        return assets.mulDivDown(_totalSupply, _totalAssets);
     }
 
     /// @dev performs rebalancing logic to maintain delta neutrality
@@ -226,8 +274,9 @@ contract MarketNeutralVault is IMarketNeutralVault, ERC20, Owned, ReentrancyGuar
 
     /// @dev deploys deposited assets across spot and perpetual strategies
     function _deployAssets(uint256 assets) internal {
+        // Calculate 50/50 split, ensuring all assets are allocated even for odd amounts
         uint256 spotAmount = assets / 2;
-        uint256 perpAmount = assets - spotAmount;
+        uint256 perpAmount = assets - spotAmount; // Gets the remainder for odd amounts
 
         _deployToSpotStrategy(spotAmount);
         _deployToPerpStrategy(perpAmount);
@@ -237,16 +286,20 @@ contract MarketNeutralVault is IMarketNeutralVault, ERC20, Owned, ReentrancyGuar
     /// @dev deploys amount to spot strategy for ETH exposure
     function _deployToSpotStrategy(uint256 amount) internal {
         if (amount > 0) {
-            USDC.approve(address(spotStrategy), amount);
-            spotStrategy.deposit(amount);
+            SafeTransferLib.safeApprove(ERC20(address(USDC)), address(spotStrategy), amount);
+            uint256 deposited = spotStrategy.deposit(amount);
+            // Ensure the strategy accepted the full amount
+            if (deposited != amount) revert StrategyDepositFailed();
         }
     }
 
     /// @dev deploys amount to perpetual strategy for short positions
     function _deployToPerpStrategy(uint256 amount) internal {
         if (amount > 0) {
-            USDC.approve(address(perpStrategy), amount);
-            perpStrategy.deposit(amount);
+            SafeTransferLib.safeApprove(ERC20(address(USDC)), address(perpStrategy), amount);
+            uint256 deposited = perpStrategy.deposit(amount);
+            // Ensure the strategy accepted the full amount
+            if (deposited != amount) revert StrategyDepositFailed();
         }
     }
 
@@ -268,17 +321,29 @@ contract MarketNeutralVault is IMarketNeutralVault, ERC20, Owned, ReentrancyGuar
 
     /// @dev withdraws proportional amount from spot strategy
     function _withdrawFromSpotStrategy(uint256 assets, uint256 totalAssetsBefore) internal {
-        uint256 spotWithdraw = (assets * spotStrategy.totalAssets()) / totalAssetsBefore;
+        uint256 spotAssets = spotStrategy.totalAssets();
+        if (spotAssets == 0) return;
+
+        // Use higher precision calculation to minimize rounding errors
+        uint256 spotWithdraw = (assets * spotAssets * PRECISION) / (totalAssetsBefore * PRECISION);
         if (spotWithdraw > 0) {
-            spotStrategy.withdraw(spotWithdraw);
+            uint256 withdrawn = spotStrategy.withdraw(spotWithdraw);
+            // Ensure we received the expected amount
+            if (withdrawn != spotWithdraw) revert InsufficientBalance();
         }
     }
 
     /// @dev withdraws proportional amount from perpetual strategy
     function _withdrawFromPerpStrategy(uint256 assets, uint256 totalAssetsBefore) internal {
-        uint256 perpWithdraw = (assets * perpStrategy.totalAssets()) / totalAssetsBefore;
+        uint256 perpAssets = perpStrategy.totalAssets();
+        if (perpAssets == 0) return;
+
+        // Use higher precision calculation to minimize rounding errors
+        uint256 perpWithdraw = (assets * perpAssets * PRECISION) / (totalAssetsBefore * PRECISION);
         if (perpWithdraw > 0) {
-            perpStrategy.withdraw(perpWithdraw);
+            uint256 withdrawn = perpStrategy.withdraw(perpWithdraw);
+            // Ensure we received the expected amount
+            if (withdrawn != perpWithdraw) revert InsufficientBalance();
         }
     }
 }
